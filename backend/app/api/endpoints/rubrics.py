@@ -37,7 +37,11 @@ def get_rubric_by_question(
     deps.get_owned_question(question_id, db, current_user)
     rubric = db.query(Rubric).filter(Rubric.question_id == question_id).first()
     if not rubric:
-        raise HTTPException(status_code=404, detail="Rubric not found")
+        # Create an empty rubric if it doesn't exist (e.g. if AI generation failed)
+        rubric = Rubric(question_id=question_id, is_approved=False)
+        db.add(rubric)
+        db.commit()
+        db.refresh(rubric)
     return rubric
 
 class CriterionUpdate(BaseModel):
