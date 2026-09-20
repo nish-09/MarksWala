@@ -1,0 +1,17 @@
+# Production overrides:  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# Put a TLS-terminating reverse proxy (Caddy / nginx / a cloud load balancer) in front of the frontend on :3000.
+# Required in .env: SECRET_KEY (32+ random chars), POSTGRES_PASSWORD, GEMINI_API_KEY, CORS_ORIGINS=https://your.domain
+services:
+  postgres: {restart: always, ports: !reset []}
+  redis: {restart: always}
+  qdrant: {restart: always}
+  backend:
+    restart: always
+    ports: !reset []
+    environment: {APP_ENV: production, COOKIE_SECURE: "true", LOG_LEVEL: INFO}
+  worker:
+    restart: always
+    environment: {APP_ENV: production, COOKIE_SECURE: "true"}
+  frontend:
+    restart: always
+    ports: ["127.0.0.1:3000:3000"]   # only the reverse proxy on the host can reach it

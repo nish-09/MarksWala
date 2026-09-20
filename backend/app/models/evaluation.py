@@ -1,64 +1,227 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, Text, Boolean, DateTime
-from sqlalchemy.orm import relationship
-from app.db.base_class import Base
-import datetime
+"""AI evaluations, criterion scores, confidence flags, teacher review/overrides and results."""
+from __future__ import annotations
 
-class Student(Base):
-    id = Column(Integer, primary_key=True, index=True)
-    roll_number = Column(String(100), index=True)
-    name = Column(String(255))
+import uuid
+from datetime import datetime
+from decimal import Decimal
 
-class AnswerSheet(Base):
-    id = Column(Integer, primary_key=True, index=True)
-    exam_id = Column(Integer, ForeignKey("exam.id"), nullable=False)
-    student_id = Column(Integer, ForeignKey("student.id"), nullable=False)
-    file_path = Column(String(500), nullable=False)
-    uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
-    status = Column(String(20), default="PROCESSING")  # PROCESSING, COMPLETED, FAILED
-    error_message = Column(String(500), nullable=True)
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text as sql_text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-    exam = relationship("Exam")
-    student = relationship("Student")
-    answers = relationship("Answer", back_populates="answer_sheet")
+from app.db.base import Base, TimestampMixin, enum_col, marks_col, uuid_pk
+from app.models.enums import (
+    EvaluationStatus,
+    FlagKind,
+    FlagSeverity,
+    ResultStatus,
+    ReviewDecision,
+    ReviewStatus,
+    TextSource,
+)
 
-class Answer(Base):
-    id = Column(Integer, primary_key=True, index=True)
-    answer_sheet_id = Column(Integer, ForeignKey("answersheet.id"), nullable=False)
-    question_id = Column(Integer, ForeignKey("question.id"), nullable=False)
-    ocr_text = Column(Text, nullable=True)
-    corrected_text = Column(Text, nullable=True)
-    page_image_path = Column(String(500), nullable=True)
-    
-    # Confidence metrics
-    ocr_confidence = Column(Float, nullable=True)
-    mapping_confidence = Column(Float, nullable=True)
-    
-    answer_sheet = relationship("AnswerSheet", back_populates="answers")
-    question = relationship("Question")
-    evaluation = relationship("Evaluation", uselist=False, back_populates="answer")
 
 class Evaluation(Base):
-    id = Column(Integer, primary_key=True, index=True)
-    answer_id = Column(Integer, ForeignKey("answer.id"), nullable=False)
-    total_score = Column(Float, nullable=False, default=0.0)
-    ai_score = Column(Float, nullable=True)
-    feedback = Column(Text, nullable=True)
-    evaluation_confidence = Column(Float, nullable=True)
-    is_reviewed = Column(Boolean, default=False)
-    teacher_override = Column(Boolean, default=False)
-    override_reason = Column(Text, nullable=True)
-    reviewed_by = Column(Integer, ForeignKey("user.id"), nullable=True)
-    reviewed_at = Column(DateTime, nullable=True)
-    
-    answer = relationship("Answer", back_populates="evaluation")
-    criterion_scores = relationship("CriterionScore", back_populates="evaluation")
+    """One AI evaluation of one answer against one rubric version. Never mutated after creation
+    (except `is_current` when a newer evaluation supersedes it) — teacher changes go to TeacherOverride."""
 
-class CriterionScore(Base):
-    id = Column(Integer, primary_key=True, index=True)
-    evaluation_id = Column(Integer, ForeignKey("evaluation.id"), nullable=False)
-    criterion_id = Column(Integer, ForeignKey("rubriccriterion.id"), nullable=False)
-    score = Column(Float, nullable=False)
-    evidence = Column(Text, nullable=True)
-    
-    evaluation = relationship("Evaluation", back_populates="criterion_scores")
-    criterion = relationship("RubricCriterion")
+    __tablename__ = "evaluations"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    answer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("answers.id", ondelete="CASCADE"), nullable=False, index=True)
+    rubric_version_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("rubric_versions.id"), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[EvaluationStatus] = enum_col(EvaluationStatus, nullable=False)
+    text_source: Mapped[TextSource] = enum_col(TextSource, nullable=False)
+    answer_text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    ai_total: Mapped[Decimal] = marks_col(nullable=False)  # computed in the backend from criterion scores
+    max_total: Mapped[Decimal] = marks_col(nullable=False)
+    overall_feedback: Mapped[str | None] = mapped_column(Text)
+
+    ocr_confidence: Mapped[float | None] = mapped_column(Float)
+    mapping_confidence: Mapped[float | None] = mapped_column(Float)
+    retrieval_confidence: Mapped[float | None] = mapped_column(Float)
+    rubric_confidence: Mapped[float | None] = mapped_column(Float)
+    evaluation_confidence: Mapped[float | None] = mapped_column(Float)
+    overall_confidence: Mapped[float | None] = mapped_column(Float)
+
+    requires_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    raw_output: Mapped[dict | None] = mapped_column(JSONB)  # the validated structured AI response
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql_text("now()"), nullable=False)
+
+    criteria: Mapped[list["EvaluationCriterion"]] = relationship(
+        back_populates="evaluation", cascade="all, delete-orphan", order_by="EvaluationCriterion.position"
+    )
+    sources: Mapped[list["EvaluationSource"]] = relationship(
+        back_populates="evaluation", cascade="all, delete-orphan", order_by="EvaluationSource.rank"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("answer_id", "attempt", name="uq_evaluations_answer_attempt"),
+        Index("uq_evaluations_current", "answer_id", unique=True, postgresql_where=sql_text("is_current")),
+        CheckConstraint("ai_total >= 0 AND ai_total <= max_total", name="total_in_range"),
+    )
+
+
+class EvaluationCriterion(Base):
+    __tablename__ = "evaluation_criteria"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    evaluation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evaluations.id", ondelete="CASCADE"), nullable=False, index=True)
+    rubric_criterion_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("rubric_criteria.id"), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    score: Mapped[Decimal] = marks_col(nullable=False)
+    max_score: Mapped[Decimal] = marks_col(nullable=False)
+    satisfied: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    partial: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    evidence: Mapped[str | None] = mapped_column(Text)
+    missing_points: Mapped[str | None] = mapped_column(Text)
+    feedback: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+
+    evaluation: Mapped[Evaluation] = relationship(back_populates="criteria")
+
+    __table_args__ = (
+        UniqueConstraint("evaluation_id", "rubric_criterion_id", name="uq_evaluation_criteria_eval_criterion"),
+        CheckConstraint("score >= 0 AND score <= max_score", name="score_in_range"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_range"),
+    )
+
+
+class EvaluationSource(Base):
+    """Retrieval provenance: which course chunks the evaluator was shown."""
+
+    __tablename__ = "evaluation_sources"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    evaluation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evaluations.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("resource_chunks.id", ondelete="SET NULL"))
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("resources.id", ondelete="SET NULL"))
+    resource_title: Mapped[str] = mapped_column(String(300), nullable=False)
+    page_number: Mapped[int | None] = mapped_column(Integer)
+    slide_number: Mapped[int | None] = mapped_column(Integer)
+    section: Mapped[str | None] = mapped_column(String(300))
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    text_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+
+    evaluation: Mapped[Evaluation] = relationship(back_populates="sources")
+
+
+class ConfidenceFlag(Base):
+    __tablename__ = "confidence_flags"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    answer_sheet_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("answer_sheets.id", ondelete="CASCADE"), nullable=False, index=True)
+    answer_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("answers.id", ondelete="CASCADE"), index=True)
+    evaluation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("evaluations.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[FlagKind] = enum_col(FlagKind, nullable=False)
+    severity: Mapped[FlagSeverity] = enum_col(FlagSeverity, nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    threshold: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql_text("now()"), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TeacherReview(Base, TimestampMixin):
+    """The review task for one evaluation (created when it is flagged, or lazily on first teacher action)."""
+
+    __tablename__ = "teacher_reviews"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    evaluation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evaluations.id", ondelete="CASCADE"), nullable=False, unique=True)
+    answer_sheet_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("answer_sheets.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[ReviewStatus] = enum_col(ReviewStatus, nullable=False, default=ReviewStatus.PENDING)
+    mandatory: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    decision: Mapped[ReviewDecision | None] = enum_col(ReviewDecision, nullable=True)
+    reviewer_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    notes: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TeacherOverride(Base):
+    """Append-only history of teacher score changes for one criterion. The AI score is never touched."""
+
+    __tablename__ = "teacher_overrides"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    evaluation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evaluations.id", ondelete="CASCADE"), nullable=False, index=True)
+    evaluation_criterion_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evaluation_criteria.id", ondelete="CASCADE"), nullable=False
+    )
+    review_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("teacher_reviews.id", ondelete="SET NULL"))
+    ai_score: Mapped[Decimal] = marks_col(nullable=False)
+    teacher_score: Mapped[Decimal] = marks_col(nullable=False)
+    final_score: Mapped[Decimal] = marks_col(nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    teacher_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql_text("now()"), nullable=False)
+
+    __table_args__ = (
+        Index("uq_teacher_overrides_active", "evaluation_criterion_id", unique=True, postgresql_where=sql_text("is_active")),
+        CheckConstraint("length(btrim(reason)) > 0", name="reason_not_blank"),
+        CheckConstraint("teacher_score >= 0 AND final_score >= 0", name="scores_nonneg"),
+    )
+
+
+class StudentResult(Base, TimestampMixin):
+    __tablename__ = "student_results"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    exam_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exams.id", ondelete="CASCADE"), nullable=False, index=True)
+    student_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("students.id", ondelete="SET NULL"))
+    answer_sheet_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("answer_sheets.id", ondelete="CASCADE"), nullable=False, unique=True)
+    total: Mapped[Decimal] = marks_col(nullable=False)
+    max_total: Mapped[Decimal] = marks_col(nullable=False)
+    percentage: Mapped[Decimal] = marks_col(nullable=False)
+    passed: Mapped[bool | None] = mapped_column(Boolean)
+    status: Mapped[ResultStatus] = enum_col(ResultStatus, nullable=False)
+    pending_reviews: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql_text("now()"), nullable=False)
+    feedback: Mapped[dict | None] = mapped_column(JSONB)
+    feedback_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (CheckConstraint("total >= 0 AND total <= max_total", name="total_in_range"),)
+
+
+class TopicResult(Base):
+    __tablename__ = "topic_results"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    exam_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exams.id", ondelete="CASCADE"), nullable=False, index=True)
+    answer_sheet_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("answer_sheets.id", ondelete="CASCADE"), nullable=False)
+    student_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("students.id", ondelete="SET NULL"))
+    topic: Mapped[str] = mapped_column(String(200), nullable=False)
+    score: Mapped[Decimal] = marks_col(nullable=False)
+    max_score: Mapped[Decimal] = marks_col(nullable=False)
+    percentage: Mapped[Decimal] = marks_col(nullable=False)
+
+    __table_args__ = (UniqueConstraint("answer_sheet_id", "topic", name="uq_topic_results_sheet_topic"),)
+
+
+class ExamAnalytics(Base):
+    __tablename__ = "exam_analytics"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    exam_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("exams.id", ondelete="CASCADE"), nullable=False, unique=True)
+    data: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql_text("now()"), nullable=False)

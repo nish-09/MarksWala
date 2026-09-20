@@ -1,0 +1,29 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+backend/.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/storage/
+.pytest_cache/
+.ruff_cache/
+*.db
+
+# node / next
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+*.tsbuildinfo
+
+# local tooling + generated
+.ai-cache/
+scripts/.fonts/
+tests/.worker.log
+backend/tests/.worker.log
+.claude/

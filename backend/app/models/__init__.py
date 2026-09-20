@@ -1,8 +1,25 @@
-from app.db.base_class import Base
-from app.models.user import User
-from app.models.course import Course
-from app.models.exam import Exam
-from app.models.resource import Resource
-from app.models.question import Question
-from app.models.rubric import Rubric, RubricCriterion
-from app.models.evaluation import Student, AnswerSheet, Answer, Evaluation, CriterionScore
+"""Import every model so Base.metadata is complete (Alembic and tests rely on this)."""
+from app.models.answers import Answer, AnswerMapping, AnswerPage, AnswerSheet, AnswerSheetBatch, OcrResult
+from app.models.evaluation import (
+    ConfidenceFlag,
+    Evaluation,
+    EvaluationCriterion,
+    EvaluationSource,
+    ExamAnalytics,
+    StudentResult,
+    TeacherOverride,
+    TeacherReview,
+    TopicResult,
+)
+from app.models.exams import Exam, Question, Rubric, RubricCriterion, RubricVersion, Subquestion
+from app.models.identity import Course, CourseMember, Student, User, UserSession
+from app.models.resources import Resource, ResourceChunk, ResourceFile
+from app.models.system import AuditLog, ProcessingJob
+
+__all__ = [
+    "Answer", "AnswerMapping", "AnswerPage", "AnswerSheet", "AnswerSheetBatch", "AuditLog", "ConfidenceFlag",
+    "Course", "CourseMember", "Evaluation", "EvaluationCriterion", "EvaluationSource", "Exam", "ExamAnalytics",
+    "OcrResult", "ProcessingJob", "Question", "Resource", "ResourceChunk", "ResourceFile", "Rubric",
+    "RubricCriterion", "RubricVersion", "Student", "StudentResult", "Subquestion", "TeacherOverride",
+    "TeacherReview", "TopicResult", "User", "UserSession",
+]

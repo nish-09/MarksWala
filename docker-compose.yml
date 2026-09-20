@@ -1,31 +1,61 @@
-version: '3.8'
+# MarksWala — development stack. `docker compose up --build`  ->  http://localhost:3000
+# Secrets come from ./.env (copy .env.example). Service hostnames below override the localhost defaults.
+name: markswala
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-development}
+  DATABASE_URL: postgresql+psycopg://marks:${POSTGRES_PASSWORD:-marks}@postgres:5432/markswala
+  REDIS_URL: redis://redis:6379/0
+  QDRANT_URL: http://qdrant:6333
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.5-flash}
+  GEMINI_VISION_MODEL: ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
+  GEMINI_EVAL_MODEL: ${GEMINI_EVAL_MODEL:-}
+  SECRET_KEY: ${SECRET_KEY:-dev-only-insecure-secret-change-me}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  STORAGE_LOCAL_ROOT: /data/storage
 
 services:
-  db:
-    image: mysql:8.0
-    restart: always
+  postgres:
+    image: postgres:16-alpine
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: markswala
-    ports:
-      - "3306:3306"
-    volumes:
-      - db_data:/var/lib/mysql
+      POSTGRES_USER: marks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marks}
+      POSTGRES_DB: markswala
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U marks -d markswala"], interval: 5s, timeout: 3s, retries: 20}
+    ports: ["127.0.0.1:5432:5432"]
 
   redis:
-    image: redis:7
-    restart: always
-    ports:
-      - "6379:6379"
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20}
 
   qdrant:
-    image: qdrant/qdrant:v1.7.0
-    restart: always
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
+    image: qdrant/qdrant:v1.15.0
+    volumes: [qdrantdata:/qdrant/storage]
+    healthcheck: {test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"], interval: 5s, timeout: 3s, retries: 20}
 
-volumes:
-  db_data:
-  qdrant_data:
+  backend:
+    build: ./backend
+    environment: *backend-env
+    depends_on: {postgres: {condition: service_healthy}, redis: {condition: service_healthy}, qdrant: {condition: service_healthy}}
+    volumes: [storage:/data/storage]
+    healthcheck: {test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"], interval: 10s, timeout: 3s, retries: 12}
+    ports: ["127.0.0.1:8000:8000"]
+
+  worker:
+    build: ./backend
+    command: ["dramatiq", "app.tasks.actors", "--processes", "1", "--threads", "4"]
+    environment: *backend-env
+    depends_on: {backend: {condition: service_healthy}}   # waits for migrations
+    volumes: [storage:/data/storage]
+
+  frontend:
+    build: {context: ./frontend, args: {BACKEND_URL: "http://backend:8000"}}
+    depends_on: {backend: {condition: service_healthy}}
+    ports: ["3000:3000"]
+
+volumes: {pgdata: {}, redisdata: {}, qdrantdata: {}, storage: {}}

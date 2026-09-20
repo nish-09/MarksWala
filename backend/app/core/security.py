@@ -1,22 +1,40 @@
-from datetime import datetime, timedelta
-from jose import jwt
-import bcrypt
+"""Password hashing and session-token primitives."""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import secrets
+
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+
 from app.core.config import settings
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+_hasher = PasswordHasher()  # argon2id with library defaults
 
-def get_password_hash(password: str) -> str:
-    salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-    return hashed.decode('utf-8')
+# Verified against when the account does not exist, so login timing does not reveal valid emails.
+_DUMMY_HASH = _hasher.hash("MarksWala-dummy-password")
 
-def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    return encoded_jwt
+
+def hash_password(password: str) -> str:
+    return _hasher.hash(password)
+
+
+def verify_password(password: str, password_hash: str | None) -> bool:
+    try:
+        return _hasher.verify(password_hash or _DUMMY_HASH, password) and password_hash is not None
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
+
+
+def needs_rehash(password_hash: str) -> bool:
+    return _hasher.check_needs_rehash(password_hash)
+
+
+def new_session_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def hash_token(token: str) -> str:
+    """Keyed hash so a database leak does not yield usable session tokens."""
+    return hmac.new(settings.secret_key.encode(), token.encode(), hashlib.sha256).hexdigest()
